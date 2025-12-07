@@ -34,28 +34,78 @@ class Calibrator:
         self.precision_step = self.PRECISION_STEP
         self.acceptance_radius = int(CALIBRATION_RADIUS/2)
         self.calibration_radius = int(CALIBRATION_RADIUS)
-
+        
         self.lock = threading.Lock()
+        self._worker = None
+        self.fitted = getattr(self, "fitted", False)
         self.calcualtion_coroutine = threading.Thread(target=self.__async_post_fit)
         self.fit_coroutines = [] 
 
     def __getstate__(self):
+        """
+        Prepare a clean state for pickling: keep numeric/model data,
+        drop threads/locks and large or runtime-only objects.
+        """
         state = self.__dict__.copy()
-        # Remove unpickleable entries
-        if 'lock' in state:
-            del state['lock']
-        if 'calcualtion_coroutine' in state:
-            del state['calcualtion_coroutine']
-        if 'fit_coroutines' in state:
-            del state['fit_coroutines']
+        # Remove non-picklable / runtime-only entries
+        for key in ("lock", "_worker", "fit_coroutines", "calcualtion_coroutine"):
+            if key in state:
+                del state[key]
+        # Optionally compact large temps if present
+        if "__tmp_X" in state:
+            del state["__tmp_X"]
+        if "__tmp_Y_x" in state:
+            del state["__tmp_Y_x"]
+        if "__tmp_Y_y" in state:
+            del state["__tmp_Y_y"]
         return state
 
     def __setstate__(self, state):
+        """
+        Restore state and recreate necessary runtime objects.
+        Also validate regressors / scaler presence after unpickle.
+        """
         self.__dict__.update(state)
-        # Recreate the lock and other non-picklable objects
+        # Recreate lock and worker placeholders
+        import threading
         self.lock = threading.Lock()
-        self.calcualtion_coroutine = threading.Thread(target=self.__async_post_fit)
+        self._worker = None
         self.fit_coroutines = []
+
+        # Basic validation: ensure regressors / scaler were serialized
+        def _is_fitted_estimator(est):
+            if est is None:
+                return False
+            # common fitted attributes
+            return any(hasattr(est, attr) for attr in ("coef_", "alpha_", "feature_importances_", "n_features_in_"))
+
+        self.reg_x = getattr(self, "reg_x", None)
+        self.reg_y = getattr(self, "reg_y", None)
+        self.scaler = getattr(self, "scaler", None)
+
+        if not _is_fitted_estimator(self.reg_x) or not _is_fitted_estimator(self.reg_y):
+            # mark as not fitted so caller can retrain or trigger fallback
+            self.fitted = False
+            # keep X/Y if present so we can re-fit later
+            # Optionally you can attempt an automatic re-fit here if X/Y are present:
+            try:
+                import numpy as _np
+                if hasattr(self, "X") and len(self.X) > 0:
+                    X = _np.array(self.X)
+                    yx = _np.array(self.Y_x)
+                    yy = _np.array(self.Y_y)
+                    # create simple fallback regressors if sklearn available
+                    try:
+                        from sklearn.linear_model import Ridge
+                        self.reg_x = Ridge(alpha=1.0).fit(X, yx)
+                        self.reg_y = Ridge(alpha=1.0).fit(X, yy)
+                        self.fitted = True
+                        print("Calibrator: fallback re-fit performed after unpickle.")
+                    except Exception:
+                        # leave unset, caller will handle
+                        pass
+            except Exception:
+                pass
 
     def __launch_fit(self):
         coroutine = threading.Thread(target=self.__async_fit)

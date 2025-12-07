@@ -7,17 +7,26 @@ import numpy as np
 import pygame
 import mouse
 import ctypes
+import time  # wait a bit for camera to be ready
+import win32con
+import win32gui
+import pickle
 
+import win32api
 from eyeGestures.utils import VideoCapture
 from eyeGestures import EyeGestures_v3
+from sklearn.linear_model import Ridge
+from calib_io import save_calibration_csv, save_calibration_npz, save_sklearn_model
+import keyboard
 
 from check import ensure_face_present, open_video_source
 
 context_tag = "eye_Tracker_v3"
 
+radio = int(sys.argv[1:][2])
 # init gestures (try passing calibration_radius if supported)
 try:
-    gestures = EyeGestures_v3(calibration_radius=70)
+    gestures = EyeGestures_v3(calibration_radius=radio)
 except TypeError:
     gestures = EyeGestures_v3()
 
@@ -26,9 +35,10 @@ except TypeError:
 # --- parse optional CLI args for camera source / resolution ---
 
 # camera
+
+time.sleep(12)  # wait a bit for camera to be ready
 cap = open_video_source(0)
-# camera
-#cap = VideoCapture(0)
+
 
 # build calibration map (normalized 0..1)
 x = np.arange(0, 1.1, 0.2)
@@ -38,36 +48,43 @@ calibration_map = np.column_stack([xx.ravel(), yy.ravel()])
 np.random.shuffle(calibration_map)
 gestures.uploadCalibrationMap(calibration_map, context=context_tag)
 
-# Try to ensure context exists (avoid KeyError on step)
+
 if hasattr(gestures, "addContext"):
     try:
         gestures.addContext(context_tag)
     except Exception:
         pass
 
-# Screen resolution (Windows)
-user32 = ctypes.windll.user32
-screen_width = user32.GetSystemMetrics(0)
-screen_height = user32.GetSystemMetrics(1)
 
-# Pygame UI
+screen_width = int(sys.argv[1:][3])
+screen_height = int(sys.argv[1:][4])
+
 pygame.init()
 pygame.font.init()
 screen = pygame.display.set_mode((screen_width, screen_height))
+hwnd = pygame.display.get_wm_info()["window"]
+
+# Getting information of the current active window
+win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, win32gui.GetWindowLong(
+                       hwnd, win32con.GWL_EXSTYLE) | win32con.WS_EX_LAYERED)
+
+win32gui.SetLayeredWindowAttributes(hwnd, win32api.RGB(255, 0, 128), 0, win32con.LWA_COLORKEY)
+# This will set the opacity and transparency color key of a layered window
+font = pygame.font.SysFont("Times New Roman", 54)
+# declare the size and font of the text for the window
+text = []
+# Declaring the array for storing the text
+text.append((font.render("Press Ctrl + Q to Escape", 0, (255, 100, 100)), (20, 250)))
 pygame.display.set_caption("EyeGestures v3 - Calibración")
 clock = pygame.time.Clock()
 bold_font = pygame.font.Font(None, 48)
 bold_font.set_bold(True)
 
-MODEL_DIR = os.path.join(os.path.dirname(__file__), ".pkl")
-os.makedirs(MODEL_DIR, exist_ok=True)
-MODEL_PATH = os.path.join(MODEL_DIR, "calibration_model_v3.pkl")
-
 iterator = 0
 prev_x = prev_y = 0
 max_points = min(len(calibration_map), 50)
 
-import sys    
+import sys
 print("In module products sys.path[0], __package__ ==", sys.path[0], __package__)
 #   sys.path.append(os.path.join(os.path.dirname(__file__), "../"))
 
@@ -76,16 +93,25 @@ print(sys.argv[1:][0])
 print(f"Recibí los argumentos: {(sys.argv[1:])}")
 max_points = int(sys.argv[1:][0])
 saved = bool(sys.argv[1:][1])
+
 running = True
 
 CHANGERADIO = True
 
+iter = 0
+MAX_ITER = 100
 print("Quick bias calibration: mira al centro de la pantalla y pulsa Enter")
 #input("Pulsa Enter cuando estés listo...")
 # captura predicciones durante 2 segundos o hasta N muestras válidas
 
 
 while running:
+         # Transparent background
+    screen.fill((255,0,128)) 
+            # stop via keyboard (non-blocking check)
+    if keyboard.is_pressed('ctrl'):
+        print("Ctrl pressed -> stopping.")
+        break
     for e in pygame.event.get():
         if e.type == pygame.QUIT:
             running = False
@@ -93,42 +119,73 @@ while running:
             if e.key == pygame.K_q and pygame.key.get_mods() & pygame.KMOD_CTRL:
                 running = False
 
-    ret, frame = cap.read()
+    if (MAX_ITER < iter):
+        break
+    try:
+        ret, frame = cap.read()
+        print("SHAPE",frame.shape)
+    except Exception:
+        iter += 1
+        print("Warning: unable to read from camera")
+        screen.blit(pygame.font.SysFont(None, 24).render("Warning: unable to read from camera", True, (255, 255, 255)), (10, 10))
+        continue
+    print("One")
     if not ret or frame is None:
         continue
-
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    frame_rgb = np.rot90(frame_rgb)
+    print("Two")
+    try:
+        if frame is not None:
+            print("Three")
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_rgb = np.rot90(frame_rgb)
+    except Exception as ex:
+        print("Three - Exception")
+        print("Error converting frame to RGB:", ex)
+        iter += 1
+        screen.blit(pygame.font.SysFont(None, 24).render("Warning: unable to process camera frame", True, (255, 255, 255)), (10, 10))
+        clock.tick(60)
+        continue
     #   frame_rgb = np.flip(frame_rgb, axis=1)
     calibrate = (iterator <= max_points)
 
     # single step call
-    
-    event, calibration = gestures.step(frame_rgb, calibrate, screen_width, screen_height, context=context_tag)
+    try:
+        print("Four")
+        event, calibration = gestures.step(frame_rgb, calibrate, screen_width, screen_height, context=context_tag)
+    except Exception as ex:
+        print("Error during gestures.step():", ex)
+        screen.blit(pygame.font.SysFont(None, 24).render("Warning: unable to read gestures", True, (255, 255, 255)), (10, 10))
+        iter += 1
+        clock.tick(60)
+        continue
     # prepare small preview
         # no valid data this frame
     if event is None and calibration is None:
+        print("Five")
         pygame.display.flip()
         clock.tick(60)
         continue
 
+    print("Six")
     surf = None
     try:
         surf = pygame.surfarray.make_surface(frame_rgb)
-        surf = pygame.transform.scale(surf, (400, 400))
+        surf = pygame.transform.scale(surf, (210, 210))
     except Exception:
         surf = None
 
-    screen.fill((0, 0, 0))
-    if surf is not None:
+    #   screen.fill((0, 0, 0))
+    
+    #   APLICALO CON ROSTRO
+    """     if surf is not None:
         ref_image = np.flip(event.sub_frame, axis=0)
         screen.blit(
             pygame.surfarray.make_surface(
                 event.sub_frame
             ),
             (screen_width/2 - 200, 0)
-        )
-        #   screen.blit(surf, (10, 10))
+        ) """
+    screen.blit(surf, (0, 10))
 
     # mover mouse si no hay evento de tracking (cuando se está dibujando calibración)
     if event and calibrate:
@@ -167,6 +224,8 @@ while running:
                         clb_obj.acceptance_radius = max(min_acc_radius,
                                                         int(clb_obj.acceptance_radius * reduction_factor))
         except Exception:
+            print("Error ajustando radios de calibración")
+            iter += 1
             pass
         """     # during calibration show target and progress
     if calibration is not None and calibrate:
@@ -203,18 +262,61 @@ while running:
     pygame.display.flip()
 
     # once finished save model and exit (close pygame to allow headless tracking script)
-    if iterator > max_points and not saved:
-        model_bytes = gestures.saveModel(context=context_tag)
-        if model_bytes:
-            with open(MODEL_PATH, "wb") as f:
-                f.write(model_bytes)
-        saved = True
+        ## model_bytes = gestures.saveModel(context=context_tag)
+        ## if model_bytes:
+        ##    with open(MODEL_PATH, "wb") as f:
+        ##        f.write(model_bytes)
+        ##saved = True
         ##  pygame.quit()
         ##  running = False
         ##  break
 
     clock.tick(60)
+if iterator >= max_points and saved:
+        out_dir = os.path.join(os.path.dirname(__file__), "saved")
+        tmp_path = os.path.join(out_dir, "my_file_v3.bin") + ".tmp"
+        os.makedirs(out_dir, exist_ok=True)
+        clb_dict = getattr(gestures, "clb", None)
+        clb = clb_dict[context_tag] 
+        # clb es tu calibrador con atributos X, Y_x, Y_y y reg_x/reg_y/scaler si existen
+        #npz_path = os.path.join(os.path.dirname(__file__), "saved", "calib_v3_data.npz")
+        dataNuevo = gestures.saveModel(context=context_tag)
+        print(dataNuevo)
+        print(clb.X)
+        print(clb.Y_y)
+        print(clb.Y_x)
+        time.sleep(14)
+        if dataNuevo:
+                # ensure we have raw bytes
+            if not isinstance(dataNuevo, (bytes, bytearray)):
+                print("Esto es un pickle aaAaAAAA")
+                data_bytes = pickle.dumps(dataNuevo)
+            else:
+                print("Yo espero de que caigas justo aquí")
+                data_bytes = bytes(dataNuevo)
 
+            # atomic write with flush+fsync
+            with open(tmp_path, "wb") as f:
+                f.write(data_bytes)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, os.path.join(out_dir, "my_file_v3.bin"))
+            #with open(os.path.join(out_dir, 'my_file_v3.bin'), 'wb') as file:
+            #    file.write(dataNuevo)
+            #file.close()
+
+        #   save_calibration_npz(npz_path, clb.X, clb.Y_x, clb.Y_y, meta={"screen": (1920, 1080)})
+
+        # opcional: guardar también los modelos entrenados
+        #   save_sklearn_model(os.path.join(os.path.dirname(__file__), "saved", "reg_x.joblib"), clb.reg_x)
+        #   save_sklearn_model(os.path.join(os.path.dirname(__file__), "saved", "reg_y.joblib"), clb.reg_y)
+        save_calibration_csv(os.path.join(os.path.dirname(__file__), "saved", "calib_v3_data.csv"), clb.X, clb.Y_x, clb.Y_y, header=None)
+        if hasattr(clb, "scaler") and clb.scaler is not None:
+            save_sklearn_model(os.path.join(out_dir, "scaler.joblib"), clb.scaler)
+
+else:
+    time.sleep(1)
+    print("Calibracion mala,")
 # cleanup
 try:
     cap.close()
@@ -226,7 +328,7 @@ try:
     print(f"Rostro detectado en {dets}/{tot} frames -> frac={frac:.2f}")
     if not ok:
         print("No se detecta rostro suficientemente estable (>0.8). Mejora iluminación/posición o cambia la fuente con --source.")
-    print("Calibración finalizada. Modelo guardado en:", MODEL_PATH)
+    print("Calibración finalizada. Modelo guardado en:")
     cap.close()
     pygame.quit()
     sys.exit("Salida del todo el programa python")

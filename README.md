@@ -268,5 +268,3 @@ Support project on Polar (in exchange we provide access to alphas versions!):
     src="https://api.star-history.com/svg?repos=NativeSensors/EyeGestures&type=Date"
   />
 </picture>
-#   E y e C o n t r o l  
- 
